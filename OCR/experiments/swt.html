@@ -1,0 +1,851 @@
+<canvas id="canvas"></canvas>
+<script src="jsfeat-custom.js"></script>
+<script src="lodash.js"></script>
+<script src="sylvester.js"></script>
+
+<script>
+var img = new Image();
+img.src = 'rotation.png';
+
+var canvas = document.getElementById('canvas');
+var ctx = canvas.getContext('2d')
+
+img.onload = function(){
+	canvas.width = img.naturalWidth;
+	canvas.height = img.naturalHeight;
+	ctx.drawImage(img, 0, 0);
+	var data = ctx.getImageData(0, 0, canvas.width, canvas.height)
+	textdetect(data)
+}
+
+var params = {
+	// the kernel size for the gaussian blur before canny
+	kernel_size: 3,
+	// low and high thresh are parameters for the canny edge detector
+	low_thresh: 124,
+	high_thresh: 204,
+	// maximum stroke width, this is the number of iterations
+	// the core stroke width transform loop will go through 
+	// before giving up and saying that there is no stroke here
+	max_stroke: 35,
+	// the maximum ratio between adjacent strokes for the 
+	// connected components algorithm to consider part of the
+	// same actual letter
+	stroke_ratio: 2,
+	// this is the pixel connectivity required for stuff to happen
+	min_connectivity: 4,
+	// the minimum number of pixels in a connected component to
+	// be considered a candidate for an actual letter
+	min_area: 30, //default: 38
+	// maximum stroke width variation allowed within a letter
+	std_ratio: 0.83,
+	// maximum aspect ratio to still be considered a letter
+	// for instance, a really long line wouldn't be considered
+	// a letter (obviously if this number is too low, it'll start
+	// excluding l's 1's and i's which would be bad)
+	aspect_ratio: 10, // default: 8
+	// maximum ratio between the median thicknesses of adjacent 
+	// letters to be considered part of the same line
+	thickness_ratio: 3,
+	// maximum ratio between adjacent letter heights to be considered
+	// part of the same line
+	height_ratio: 2.5, // original: 1.7
+}
+
+
+function Dot(a, b){ return a[0] * b[0] + a[1] * b[1] }
+function Mag(a){ return Math.sqrt(a[0] * a[0] + a[1] * a[1]) }
+function Mul(a, n){ return [a[0] * n, a[1] * n] }
+function Div(a, n){ return Mul(a, 1 / n)}
+function Unit(a) { return Div(a, Mag(a)) }
+function Sub(a, b){ return [a[0] - b[0], a[1] - b[1]]}
+function Add(a, b){ return [a[0] + b[0], a[1] + b[1]]}
+function Rot90(a) { return [-a[1], a[0]] }
+function Sum(x) { for(var i = 0, s = 0; i < x.length; i++) s += x[i]; return s }
+function Mean(x) { return Sum(x) / x.length }
+function Diff(x) { for(var i = 1, k = []; i < x.length; i++) k[i - 1] = x[i] - x[i - 1]; return k}
+function Mod(x, n) { return x - Math.round(x / n) * n }
+function moveTo(a) { c.moveTo(a[0], a[1]) }
+function lineTo(a) { c.lineTo(a[0], a[1]) }
+
+
+
+function adiff(a, b){
+	var d = Math.abs(a - b) % (Math.PI * 2);
+	var r = d > Math.PI ? (Math.PI * 2) - d : d;
+	return Math.abs(r)
+}
+
+function textdetect(src){
+	width = src.width
+	height = src.height;
+	
+	var img_u8 = new jsfeat.matrix_t(width, height, jsfeat.U8C1_t)
+	var img_dxdy = new jsfeat.matrix_t(width, height, jsfeat.S32C2_t);
+
+	console.time("image processing")
+	jsfeat.imgproc.grayscale(src.data, img_u8.data)
+	// visualize_matrix(img_u8)
+	jsfeat.imgproc.sobel_derivatives(img_u8, img_dxdy)
+	jsfeat.imgproc.gaussian_blur(img_u8, img_u8, params.kernel_size, 0)
+	jsfeat.imgproc.canny(img_u8, img_u8, params.low_thresh, params.high_thresh)
+
+	console.timeEnd("image processing")
+
+	params.direction = -1
+	swt = raw_swt(img_u8, img_dxdy, params).swt;
+	console.time('connected components')
+	contours = connected_swt(swt, params).map(wrap_contours);
+	console.timeEnd('connected components')
+	c = visualize_matrix(swt)
+
+	function wrap_line(points){
+		// linear regression to estimate slope
+		var sumx = 0, sumy=0, sumx2 = 0, sumy2 = 0, sumxy = 0;
+		for(var i = 0; i < points.length; i++){
+			var letter = points[i]
+			sumx += letter.cx; sumy += letter.cy;
+			sumx2 += letter.cx * letter.cx; sumy2 += letter.cy * letter.cy;
+			sumxy += letter.cx * letter.cy;
+		}
+
+		var n = points.length;
+		var dy = (n * sumxy - sumx * sumy);
+		var dx = (n * sumx2 - sumx * sumx);
+		var yi = (sumy * sumx2 - sumx * sumxy) / (n * sumx2 - sumx * sumx);
+		var r = (sumxy - sumx * sumy / n) / Math.sqrt((sumx2 - sumx*sumx/n) * (sumy2 - sumy*sumy/n));
+		var base = {
+			x0: _.min(_.pluck(points, 'x0')),
+			y0: _.min(_.pluck(points, 'y0')),
+			x1: _.max(_.pluck(points, 'x1')),
+			y1: _.max(_.pluck(points, 'y1')),
+		}
+		return _.assign(base, {
+			cx: base.x0 / 2 + base.x1 / 2,
+			cy: base.y0 / 2 + base.y1 / 2,	
+			angle: Math.atan2(dy, dx),
+			dx: dx,
+			dy: dy,
+			yi: yi,
+			points: points
+		})
+	}
+
+	function boxdist(a, b){
+		var width = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0),
+			height = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+		return Math.sqrt(Math.pow(Math.min(0, width), 2) + Math.pow(Math.min(0, height), 2))
+	}
+
+	console.time("rough line estimation")
+	// it might be possible to make this faster by using some spatial index
+	rough_lines = equivalence_classes(contours, function(a, b){
+		return boxdist(a, b) < 5;
+	}).filter(function(line){
+		return line.length > 1
+	}).map(wrap_line)
+	console.timeEnd("rough line estimation")
+
+	rough_lines.forEach(function(line){
+		// console.log(line)
+		var points = line.points;
+		c.beginPath()
+		c.moveTo(points[0].cx, points[0].cy)
+		for(var i = 1; i < points.length; i++){
+			c.lineTo(points[i].cx, points[i].cy)
+		}
+		c.strokeStyle = 'pink'
+		c.lineWidth = 5;
+		c.stroke()
+	})
+	
+
+	console.time('projective merging')
+	// it might be possible to make this faster with some spatial indexing
+	refined_lines = equivalence_classes(rough_lines, function(a, b){
+		if(adiff(a.angle, b.angle) > 0.1) return;
+		var origin = [a.points[0].cx, a.points[0].cy],
+			dir    = Unit([a.dx, a.dy]);	
+		
+		var y_offset = Dot(Sub([b.cx, b.cy], origin), Rot90(dir));
+		if(Math.abs(y_offset) > 5) return;
+
+		var a_proj = a.points.map(function(p){ return Dot(Sub([p.cx, p.cy], origin), dir) })
+		var b_proj = b.points.map(function(p){ return Dot(Sub([p.cx, p.cy], origin), dir) })
+
+		var a0 = _.min(a_proj), a1 = _.max(a_proj);
+		var b0 = _.min(b_proj), b1 = _.max(b_proj);
+
+		var dist = Math.min(a1, b1) - Math.max(a0, b0); // dist > 0 = intersecting, abs(dist < 0) = distance
+
+		return dist < 0 && dist > -20;
+	}).map(function(lines){
+		return wrap_line(_.flatten(_.pluck(lines, 'points')))
+	})
+	console.timeEnd('projective merging')
+
+
+	// console.time('angle merging')
+
+	// function pairdist(x){
+	// 	var a = x[0], b = x[1];
+	// 	var width = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0),
+	// 		height = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+	// 	var dist = Math.sqrt(Math.pow(Math.min(0, width), 2) + Math.pow(Math.min(0, height), 2));
+	// 	return dist;
+	// }
+
+	// var refined_lines = equivalence_classes(rough_lines, function(a, b){
+	// 	if(adiff(a.angle, b.angle) > 0.1) return;
+
+	// 	var stuff = []
+	// 	for(var i = 0; i < a.points.length; i++)
+	// 		for(var j = 0; j < b.points.length; j++)
+	// 			stuff.push([a.points[i], b.points[j]]);
+
+	// 	var minab = _.min(stuff, pairdist)
+		
+	// 	if(pairdist(minab) > 30) return;
+
+	// 	var pa = minab[0], pb = minab[1];
+		
+	// 	var ba = Math.atan2(pa.cy - pb.cy, pa.cx - pb.cx);
+
+	// 	if(adiff(ba, a.angle) > 0.1) return;
+	// 	return true;
+	// }).map(function(lines){
+	// 	return wrap_line(_.flatten(_.pluck(lines, 'points')))
+	// })
+
+	// console.timeEnd('angle merging')
+
+	refined_lines.forEach(function(line){
+		var points = line.points;
+		c.beginPath()
+		c.moveTo(points[0].cx, points[0].cy)
+		for(var i = 1; i < points.length; i++){
+			c.lineTo(points[i].cx, points[i].cy)
+		}
+		c.strokeStyle = 'gray'
+		c.lineWidth = 2;
+		c.stroke()
+	});
+
+	// largest empty rectangle algorithms
+	// return
+
+	// console.time('ransac')
+
+	// do {
+	// 	var sample = _.sample(refined_lines, 2);
+	// 	var a = sample[0], b = sample[1]
+
+
+	// 	var dir = Unit(Rot90([a.dx + b.dx, a.dy + b.dy]));	
+	// 	var origin = [a.cx, a.cy];
+	// 	var len = Math.abs(Dot(Sub([b.cx, b.cy], origin), dir));
+
+	// } while (boxdist(a, b) > 100 || adiff(a.angle, b.angle) > 0.1 || len < 5);
+	// // find things that are nearby and almost-parallel
+
+	// c.fillStyle = 'yellow'
+	// c.fillRect(a.cx - 25, a.cy - 25, 50, 50)
+
+	// for(var n = -10; n < 10; n++){
+	// 	moveTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir), -1000)))
+	// 	lineTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir),  1000)))
+	// 	c.strokeStyle = 'orange'
+	// 	c.lineWidth = 1
+	// 	c.stroke()
+	// }
+
+	// // for(var n = -10; n < 10; n++){
+	// // 	moveTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir, -1000)))
+	// // 	lineTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir,  1000)))
+	// // 	c.strokeStyle = 'yellow'
+	// // 	c.lineWidth = 1
+	// // 	c.stroke()
+	// // }
+	// // c.beginPath()
+	// // c.moveTo(a.cx, a.cy)
+	// // c.lineTo(a.cx + dir[0] * a1, a.cy + dir[1] * a1);
+	// // c.strokeStyle = 'yellow'
+	// // c.lineWidth = 4
+	// // c.stroke()
+	
+	// // console.log(a1)
+
+	// vgroups = {}
+	// for(var i = 0; i < contours.length; i++){
+	// 	var s = contours[i];
+	// 	var a1 = Dot(Sub([s.cx, s.cy], origin), dir);
+	// 	var err = Math.abs(Math.abs(a1 % len) - len/2) - len/2;
+
+	// 	if(Math.abs(err) < 10){
+	// 		var k = Math.round(a1 / len);
+	// 		if(!vgroups[k]) vgroups[k] = 0;
+	// 		vgroups[k]++
+	// 	}
+	// }
+
+	// var tbound = 0, bbound = 0;
+	// while(vgroups[tbound] > 0) tbound--;
+	// while(vgroups[bbound] > 0) bbound++;
+
+
+	// c.beginPath()
+	// var n = tbound;
+	// moveTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir), -1000)))
+	// lineTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir),  1000)))
+	// var n = bbound;
+	// moveTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir), -1000)))
+	// lineTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir),  1000)))
+	// c.strokeStyle = 'green'
+	// c.lineWidth = 4
+	// c.stroke()
+
+	// console.log(dir)
+
+	// hgroups = {};
+	// for(var i = 0; i < contours.length; i++){
+	// 	var s = contours[i];
+	// 	var a1 = Dot(Sub([s.cx, s.cy], origin), dir);
+	// 	var k = Math.round(a1 / len);
+	// 	if(k <= tbound || k >= bbound) continue;
+	// 	var b1 = Dot(Sub([s.cx, s.cy], origin), Rot90(dir));
+	// 	var j = Math.round(b1 / len);
+
+	// 	var err = Math.abs(Math.abs(a1 % len) - len/2) - len/2;
+
+	// 	if(Math.abs(err) < 10){			
+	// 		if(!hgroups[j]) hgroups[j] = 0;
+	// 		hgroups[j]++
+	// 	}
+	// }
+
+	// var lbound = 0, rbound = 0;
+	// while(hgroups[lbound] > 0) lbound--;
+	// while(hgroups[rbound] > 0) rbound++;
+
+	// for(var i = 0; i < contours.length; i++){
+	// 	var s = contours[i];
+	// 	var a1 = Dot(Sub([s.cx, s.cy], origin), dir);
+	// 	var k = Math.round(a1 / len);
+	// 	if(k <= tbound || k >= bbound) continue;
+	// 	var b1 = Dot(Sub([s.cx, s.cy], origin), Rot90(dir));
+	// 	var j = Math.round(b1 / len);
+	// 	if(j <= lbound || j >= rbound) continue;
+
+	// 	var err = Math.abs(Math.abs(a1 % len) - len/2) - len/2;
+
+	// 	if(Math.abs(err) < 10){			
+	// 		c.fillStyle = 'green'
+	// 		c.fillRect(s.cx - 5, s.cy - 5, 10, 10)
+	// 	}else{
+	// 		c.fillStyle = 'red'
+	// 		c.fillRect(s.cx - 5, s.cy - 5, 10, 10)
+	// 	}
+	// }
+
+
+	// c.beginPath()
+	// var n = lbound;
+	// moveTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir, -1000)))
+	// lineTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir,  1000)))
+	// var n = rbound;
+	// moveTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir, -1000)))
+	// lineTo(Add(Add(origin, Mul(Rot90(dir), len * n)), Mul(dir,  1000)))
+	// c.strokeStyle = 'green'
+	// c.lineWidth = 4
+	// c.stroke()
+
+	
+
+	// console.timeEnd('ransac')
+
+
+	console.time('ransac2')
+
+	do {
+		var sample = _.sample(refined_lines, 2);
+		var a = sample[0], b = sample[1]
+
+
+		var dir = Unit(Rot90([a.dx + b.dx, a.dy + b.dy]));	
+		var origin = [a.cx, a.cy];
+		var len = Math.abs(Dot(Sub([b.cx, b.cy], origin), dir));
+
+
+	} while (boxdist(a, b) > 100 || adiff(a.angle, b.angle) > 0.1 || len < 5);
+	// find things that are nearby and almost-parallel
+	console.log('sampled len', len)
+
+	// c.fillStyle = 'yellow'
+	// c.fillRect(a.cx - 25, a.cy - 25, 50, 50)
+	moveTo(Add(Add(origin, Mul(dir, 0)), Mul(Rot90(dir), -1000)))
+	lineTo(Add(Add(origin, Mul(dir, 0)), Mul(Rot90(dir),  1000)))
+
+	moveTo(Add(Add(origin, Mul(dir, len)), Mul(Rot90(dir), -1000)))
+	lineTo(Add(Add(origin, Mul(dir, len)), Mul(Rot90(dir),  1000)))
+	// for(var n = -10; n < 10; n++){
+	// 	moveTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir), -1000)))
+	// 	lineTo(Add(Add(origin, Mul(dir, len * n)), Mul(Rot90(dir),  1000)))
+	c.strokeStyle = 'orange'
+	c.lineWidth = 5
+	c.stroke()
+	// }
+
+	function blob_generator(origin, dir, len){
+		return function blobgen(s){
+			var a1 = Dot(Sub([s.cx, s.cy], origin), dir);
+			// TODO: make error something more aware of contour geometry
+			// like the distance from the edge where passing through the shape
+			// counts as 0 error
+			var err = Math.abs(Math.abs(a1 % len) - len/2) - len/2;
+			// a better metric for whetheor or not we have the valid configuration
+			// is to measure the number of things in the expected range
+			// and also the ones which lie in between the expected range
+			// and assign that a cost
+			var b1 = Dot(Sub([s.cx, s.cy], origin), Rot90(dir));
+			return {
+				inlier: Math.abs(err) < 10,
+				a1: a1,
+				b1: b1,
+				k: Math.round(a1 / len),
+				j: Math.round(b1 / len),
+				s: s
+			}
+		}
+	}
+
+	// find a vertical bound for the range of this text region
+	function inlier_ratio(range, aggregator){
+		return _.mapValues(_.groupBy(range, aggregator), function(x){
+			var d = _.countBy(x, 'inlier');
+			return (d.true || 0) / ((d.true || 0) + (d.false || 0));
+		})
+	}
+
+	function bound_inliers(range, aggregator, bthresh){
+		var groups = inlier_ratio(range, aggregator);
+		var lower = 0, upper = 0;
+		while(groups[lower] > bthresh) lower--;
+		while(groups[upper] > bthresh) upper++;
+		if(lower == 0 || upper == 0) console.error(aggregator, " grouping yielded no results");
+		return [lower, upper]
+	}
+
+	function thresh_filter(range, thresh, prop){
+		return range.filter(function(s){ return s[prop] > thresh[0] && s[prop] < thresh[1] })
+	}
+
+
+	var blobs = contours.map(blob_generator(origin, dir, len))
+	var range = blobs.slice(0); 
+	
+	var bthresh = 0.7;
+	var vthresh = bound_inliers(range, 'k', bthresh);
+	range = thresh_filter(range, vthresh, 'k')
+	var hthresh = bound_inliers(range, 'j', bthresh);
+	range = thresh_filter(range, hthresh, 'j')
+	// TODO?: perhaps refine the vertical bound given this new horizontal bound
+
+	lines = _.groupBy(_.where(range, { inlier: true }), 'k');
+	var total = _.values(lines).map(function(blobs){
+		var line = wrap_line(_.pluck(blobs, 's'));
+		return Mul([line.dx, line.dy], blobs.length)
+	});
+	var dir_adj = Rot90(Unit([Sum(_.pluck(total, 0)), Sum(_.pluck(total, 1))]))
+	var len_adj = Mean(Diff(_.sortBy(_.values(lines).map(function(e){
+		return Mean(_.pluck(e, 'a1'))
+	})))); // what is this? lisp?
+	// TODO: refine the choice of origin
+	var ori_adj = Mean(_.values(lines).map(function(e){return Mod(Mean(_.pluck(e, 'a1')),24.901969835719317)}))
+
+	console.log(dir_adj, dir, 'direction adjustment')
+	console.log(len_adj, len, 'length adjustment')
+	console.log(ori_adj, 'origin adjustment')
+
+	var blobs2 = contours.map(blob_generator(origin, dir_adj, len_adj))
+	var range2 = blobs2;
+	var vthresh2 = bound_inliers(range2, 'k', bthresh);
+	range2 = thresh_filter(range2, vthresh2, 'k')
+	var hthresh2 = bound_inliers(range2, 'j', bthresh);
+	range2 = thresh_filter(range2, hthresh2, 'j')
+	vthresh2 = bound_inliers(range2, 'k', bthresh);
+	range2 = thresh_filter(range2, vthresh2, 'k')
+
+	// calculate the slope of each line using the inliers
+	// calculate the proper line separation using inliers
+	// calculate the proper origin offset to minimize error
+	
+
+
+	blobs2.forEach(function(b){
+		if(b.k > vthresh2[0] && b.k < vthresh2[1] && b.j > hthresh2[0] && b.j < hthresh2[1]){
+			var s = b.s;
+			if(b.inlier){
+				c.fillStyle = 'green'
+				c.fillRect(s.cx - 5, s.cy - 5, 10, 10)
+			}else{
+				c.fillStyle = 'red'
+				c.fillRect(s.cx - 5, s.cy - 5, 10, 10)
+			}
+		}
+	})
+
+	c.beginPath()
+	for(var n = -10; n < 10; n++){
+		moveTo(Add(Add(origin, Mul(dir_adj, len_adj * n)), Mul(Rot90(dir_adj), -1000)))
+		lineTo(Add(Add(origin, Mul(dir_adj, len_adj * n)), Mul(Rot90(dir_adj),  1000)))
+		c.strokeStyle = 'red'
+		c.lineWidth = 1
+		c.stroke()
+	}
+
+
+	c.beginPath()
+	moveTo(Add(Add(origin, Mul(dir, len * vthresh[0])), Mul(Rot90(dir), len * hthresh[0])))
+	lineTo(Add(Add(origin, Mul(dir, len * vthresh[0])), Mul(Rot90(dir), len * hthresh[1])))
+	lineTo(Add(Add(origin, Mul(dir, len * vthresh[1])), Mul(Rot90(dir), len * hthresh[1])))
+	lineTo(Add(Add(origin, Mul(dir, len * vthresh[1])), Mul(Rot90(dir), len * hthresh[0])))
+	c.closePath()
+
+	c.strokeStyle = 'gray'
+	c.lineWidth = 10
+	c.stroke()
+
+	c.beginPath()
+	moveTo(Add(Add(origin, Mul(dir_adj, len * vthresh[0])), Mul(Rot90(dir_adj), len * hthresh[0])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh[0])), Mul(Rot90(dir_adj), len * hthresh[1])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh[1])), Mul(Rot90(dir_adj), len * hthresh[1])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh[1])), Mul(Rot90(dir_adj), len * hthresh[0])))
+	c.closePath()
+
+	c.strokeStyle = 'red'
+	c.lineWidth = 1
+	c.stroke()
+
+	c.beginPath()
+	moveTo(Add(Add(origin, Mul(dir_adj, len * vthresh2[0])), Mul(Rot90(dir_adj), len * hthresh2[0])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh2[0])), Mul(Rot90(dir_adj), len * hthresh2[1])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh2[1])), Mul(Rot90(dir_adj), len * hthresh2[1])))
+	lineTo(Add(Add(origin, Mul(dir_adj, len * vthresh2[1])), Mul(Rot90(dir_adj), len * hthresh2[0])))
+	c.closePath()
+
+	c.strokeStyle = 'blue'
+	c.lineWidth = 1
+	c.stroke()
+
+	
+
+	console.timeEnd('ransac2')
+
+
+}
+
+// hough transform, try to solve for a set of parallel lines at a particular orientation and line height (2 parameters)
+// alternatively, use rotating calipers to solve for the orientation of a region
+// or use rotating calipers as an initial estimate and do gradient-descent with hough transform (or ransac)
+
+
+function wrap_contours(points){
+	var size = points.length;
+	var x0 = Infinity, y0 = Infinity, x1 = 0, y1 = 0;
+
+	for(var i = 0; i < size; i++){
+		var p = points[i];
+		var x = p % width, y = Math.floor(p / width);
+		x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+		x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+
+	}
+
+	var cy = y0 + (y1 - y0) / 2,
+		cx = x0 + (x1 - x0) / 2;
+
+	return {
+		x0: x0,
+		y0: y0,
+		y1: y1,
+		x1: x1,
+		cx: cx,
+		cy: cy,
+		width: x1 - x0 + 1,
+		height: y1 - y0 + 1,
+		size: size,
+		contours: points
+	}
+}
+
+// canny & sobel dx/dy
+function raw_swt(img_canny, img_dxdy, params){
+	var max_stroke = params.max_stroke, // maximum stroke width
+		direction = params.direction,
+		width = img_canny.cols,
+		height = img_canny.rows;
+
+	// nonzero Math.min function, if a is zero, returns b, otherwise minimizes
+	function nzmin(a, b){
+		if(a === 0) return b;
+		if(a < b) return a;
+		return b;
+	}
+	
+	var strokes = [];
+	var swt = new jsfeat.matrix_t(width, height, jsfeat.U8C1_t)
+	
+	console.time("first pass")
+	// first pass of stroke width transform 
+	for(var i = 0; i < width * height; i++){
+		if(img_canny.data[i] != 0xff) continue; // only apply on edge pixels
+
+		var itheta = Math.atan2(img_dxdy.data[(i<<1) + 1], img_dxdy.data[i<<1]); // calculate the image gradient at this point by sobel
+		var ray = [i];
+		var step = 1;
+		
+		var ix = i % width, iy = Math.floor(i / width);
+		while(step < max_stroke){
+			// extrapolate the ray outwards depending on search direction
+			// libccv is particularly clever in that it uses 
+			// bresenham's line drawing algorithm to pick out
+			// the points along the line and also checks 
+			// neighboring pixels for corners
+
+			var jx = Math.round(ix + Math.cos(itheta) * direction * step);
+			var jy = Math.round(iy + Math.sin(itheta) * direction * step);
+			step++;
+			if(jx < 0 || jy < 0 || jx > width || jy > height) break;
+			var j = jy * width + jx;
+			ray.push(j)
+			if(img_canny.data[j] != 0xff) continue;
+			// calculate theta for this ray since we've reached the other side
+			var jtheta = Math.atan2(img_dxdy.data[(j<<1) + 1], img_dxdy.data[j<<1]); 
+			
+			if(Math.abs(Math.abs(itheta - jtheta) - Math.PI) < Math.PI / 2){ // check if theta reflects the starting angle approximately
+				strokes.push(i)
+				var sw = Math.sqrt((jx - ix) * (jx - ix) + (jy - iy) * (jy - iy)) // derive the stroke width
+				for(var k = 0; k < ray.length; k++){ // iterate rays and set points along ray to minimum stroke width
+					swt.data[ray[k]] = nzmin(swt.data[ray[k]], sw) // use nzmin because it's initially all 0's
+				}
+			}
+			break;
+		}
+	}
+	console.timeEnd("first pass")
+	console.time("refinement pass")
+
+	// second pass, refines swt values as median
+	for(var k = 0; k < strokes.length; k++){
+		var i = strokes[k];
+		var itheta = Math.atan2(img_dxdy.data[(i<<1) + 1], img_dxdy.data[i<<1]);
+		var ray = [];
+		var widths = []
+		var step = 1;
+
+		var ix = i % width, iy = Math.floor(i / width);
+		while(step < max_stroke){
+			var jx = Math.round(ix + Math.cos(itheta) * direction * step);
+			var jy = Math.round(iy + Math.sin(itheta) * direction * step);
+			step++;
+			var j = jy * width + jx;
+			// record position of the ray and the stroke width there
+			widths.push(swt.data[j])
+			ray.push(j)			
+			// stop when the ray is terminated
+			if(img_canny.data[j] == 0xff) break;
+		}
+		var median = widths.sort(function(a, b){return a - b})[Math.floor(widths.length / 2)];
+		// set the high values to the median so that corners are nice
+		for(var j = 0; j < ray.length; j++){
+			swt.data[ray[j]] = nzmin(swt.data[ray[j]], median)
+		}
+		// swt.data[ray[0]] = 0
+		// swt.data[ray[ray.length - 1]] = 0
+	}
+
+	console.timeEnd("refinement pass")
+	
+	// TODO: get rid of strokes
+	return {
+		swt: swt,
+		strokes: strokes
+	}
+}
+
+
+
+// maybe in the future we should replace this with a strongly
+// connected components algorithm (or have some spatial heuristic to
+// determine how wise it would be to consider the connection valid)
+function connected_swt(swt, params){
+	var dx8 = [-1, 1, -1, 0, 1, -1, 0, 1];
+	var dy8 = [0, 0, -1, -1, -1, 1, 1, 1];
+	var width = swt.cols, 
+		height = swt.rows;
+
+	var marker = new jsfeat.matrix_t(width, height, jsfeat.U8C1_t)
+	var contours = []
+	
+	for(var i = 0; i < width * height; i++){
+		if(marker.data[i] || !swt.data[i]) continue;
+
+		var ix = i % width, iy = Math.floor(i / width)
+		
+		marker.data[i] = 1
+		var contour = []
+		var stack = [i]
+		var closed;
+		
+		while(closed = stack.shift()){
+			contour.push(closed)
+			var cx = closed % width, cy = Math.floor(closed / width);
+			var w = swt.data[closed];
+			for(var k = 0; k < 8; k++){
+				var nx = cx + dx8[k]
+				var ny = cy + dy8[k]
+				var n = ny * width + nx;
+
+				if(nx >= 0 && nx < width &&
+				   ny >= 0 && ny < height &&
+				   swt.data[n] &&
+				   !marker.data[n] &&
+				   swt.data[n] <= params.stroke_ratio * w &&
+				   swt.data[n] * params.stroke_ratio >= w){
+					marker.data[n] = 1
+					// update the average stroke width
+					w = (w * stack.length + swt.data[n]) / (stack.length + 1)
+					stack.push(n)
+				}
+			}
+		}
+		// contours.push(contour)
+		if(contour.length >= params.min_area){
+			contours.push(contour)	
+		}
+	}
+	return contours
+}
+
+
+
+function visualize_matrix(mat, letters){
+	var c = document.createElement('canvas')
+	c.width = mat.cols;
+	c.height = mat.rows;
+	var cx = c.getContext('2d')
+	var out = cx.createImageData(mat.cols, mat.rows);
+	for(var i = 0; i < mat.rows * mat.cols; i++){
+
+		out.data[i * 4 + 3] = 255
+		if(mat.data[i] == 1){
+			out.data[i * 4] = 255
+			// out.data[i * 4 + 1] = out.data[i * 4 + 2] = 30 * mat.data[i]
+		}else{
+			out.data[i * 4] = out.data[i * 4 + 1] = out.data[i * 4 + 2] = 30 * mat.data[i]	
+		}
+		
+	}
+	cx.putImageData(out, 0, 0)
+	
+	if(letters){
+		cx.strokeStyle = 'red'
+		for(var i = 0; i < letters.length; i++){
+			var letter = letters[i];
+			cx.strokeRect(letter.x0 + .5, letter.y0 + .5, letter.width, letter.height)
+		}
+
+		if(letters[0] && letters[0].letters){
+			// hey look not actually letters
+			letters.forEach(function(line){
+				cx.beginPath()
+				var colors = ['green', 'blue', 'red', 'purple', 'orange', 'yellow']
+				cx.strokeStyle = colors[Math.floor(colors.length * Math.random())]
+				cx.lineWidth = 3
+
+				line.letters
+					.sort(function(a, b){ return a.cx - b.cx })
+					.forEach(function(letter){
+						cx.lineTo(letter.cx, letter.cy)
+					})
+
+				cx.stroke()
+			})
+		}
+	}
+	document.body.appendChild(c)
+
+	// console.image(c.toDataURL('image/png'))
+
+	return cx
+}
+
+
+function equivalence_classes(elements, is_equal){
+	var node = []
+	for(var i = 0; i < elements.length; i++){
+		node.push({
+			parent: 0,
+			element: elements[i],
+			rank: 0
+		})
+	}
+	for(var i = 0; i < node.length; i++){
+		var root = node[i]
+		while(root.parent){
+			root = root.parent;
+		}
+		for(var j = 0; j < node.length; j++){
+			if(i == j) continue;
+			if(!is_equal(node[i].element, node[j].element)) continue;
+			var root2 = node[j];
+			while(root2.parent){
+				root2 = root2.parent;
+			}
+			if(root2 != root){
+				if(root.rank > root2.rank){
+					root2.parent = root;
+				}else{
+					root.parent = root2;
+					if(root.rank == root2.rank){
+						root2.rank++  
+					}
+					root = root2;
+				}
+				var node2 = node[j];
+				while(node2.parent){
+					var temp = node2;
+					node2 = node2.parent;
+					temp.parent = root;
+				}
+				var node2 = node[i];
+				while(node2.parent){
+					var temp = node2;
+					node2 = node2.parent;
+					temp.parent = root;
+				}
+			}
+		}
+	}
+	var index = 0;
+	var clusters = [];
+	for(var i = 0; i < node.length; i++){
+		var j = -1;
+		var node1 = node[i]
+		while(node1.parent){
+			node1 = node1.parent
+		}
+		if(node1.rank >= 0){
+			node1.rank = ~index++;
+		}
+		j = ~node1.rank;
+
+		if(clusters[j]){
+			clusters[j].push(elements[i])
+		}else{
+			clusters[j] = [elements[i]]
+		}
+	}
+	return clusters;
+}
+</script>
