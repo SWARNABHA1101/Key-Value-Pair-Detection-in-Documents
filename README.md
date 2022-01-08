@@ -8,9 +8,11 @@ The original dataset has a few mistakes. This has been corrected by `scripts/che
 
 The dataset has 1000 whole scanned receipt images. Each receipt image contains around about four key text fields, such as goods name, unit price and total cost, etc. The text annotated in the dataset mainly consists of digits and English characters. An example scanned receipt is shown below:
 
-<div align=center><img src="./Media/data_sample.jpg" width="300"/></div>
+<div align=center><img src="./data/data_sample.jpg" width="300"/></div>
 
 The dataset is split into a training/validation set (“trainval”) and a test set (“test”). The “trainval” set consists of 600 receipt images, the “test” set consists of 400 images.
+
+The OCR used for the task is provided inside the `OCR` folder in this repo.
 
 For receipt OCR task, each image in the dataset is annotated with text bounding boxes (bbox) and the transcript of each text bbox. Locations are annotated as rectangles with four vertices, which are in clockwise order starting from the top. Annotations for an image are stored in a text file with the same file name. The annotation format is similar to that of ICDAR2015 dataset, which is shown below:
 
