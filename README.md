@@ -1,6 +1,8 @@
 # Key-Value-Pair-Detection-in-Documents
 Optical Character Recognition(OCR) and information extraction
 
+**Key-Value Pairs or KVPs are essentially two linked data items**, a key, and a value, where the key is used as a unique identifier for the value. A classic example of KVP data is the dictionary: the vocabularies are the keys, and the definitions of the vocabularies are the values associated with them. In fact, these pairs of data can exist in various types of text documents; in forms, the keys are the data types/questions (eg. Name, Age), and the values are the actual attributes you fill in correspondingly; in invoices, the keys are the items purchased, and the values could be the prices for different items.The applications of efficient KVP extraction can be roughly categorized into personal and business uses.
+
 ### Dataset and Annotations
 
 The original dataset has a few mistakes. This has been corrected by `scripts/check_data.py` and you can just use the `data` folder in this repo.
